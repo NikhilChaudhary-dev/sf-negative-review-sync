@@ -1,0 +1,42 @@
+name: Salesforce Negative Review Sync
+
+on:
+  schedule:
+    - cron: '0 18 * * *' # Rozana 11:30 PM IST par chalega
+  workflow_dispatch: # Taaki aap manually bhi run kar sakein
+
+jobs:
+  run-neg-sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests simple-salesforce gspread oauth2client python-dotenv google-auth
+
+      - name: Run Negative Review Sync
+        env:
+          GCP_CREDS: ${{ secrets.GCP_SERVICE_ACCOUNT_FILE }} 
+          SF_USERNAME: ${{ secrets.SF_USERNAME }}
+          SF_PASSWORD: ${{ secrets.SF_PASSWORD }}
+          SF_TOKEN: ${{ secrets.SF_TOKEN }}
+          DEBOUNCE_API_KEY: ${{ secrets.DEBOUNCE_API_KEY }}
+          SMARTLEAD_API_KEY: ${{ secrets.SMARTLEAD_API_KEY }}
+        run: python negative_sync.py # Aapki script ka file name
+
+      - name: Auto-Commit Changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Updated Negative Review Tracker Logs" || echo "No changes"
+          git push
