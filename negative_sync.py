@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 # ==========================================
 load_dotenv()
 
-# Credentials from Environment/GitHub Secrets
+# Credentials from GitHub Secrets
 SF_USERNAME = os.getenv('SF_USERNAME')
 SF_PASSWORD = os.getenv('SF_PASSWORD')
 SF_TOKEN = os.getenv('SF_TOKEN')
@@ -27,11 +27,10 @@ NEG_REVIEW_CAMPAIGN_ID = "2859924"
 # ==========================================
 
 def get_tracker_sheet():
-    """Connects to your new Negative_Review_Tracker file"""
+    """Connects to Negative_Review_Tracker file"""
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         creds_json = os.getenv('GCP_CREDS')
-        
         if not creds_json:
             print("❌ Error: GCP_CREDS secret is missing.")
             return None
@@ -40,15 +39,15 @@ def get_tracker_sheet():
         creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
         client = gspread.authorize(creds)
         
-        # ✅ Aapka Naya Sheet Name
+        # Nayi spreadsheet file ka naam
         spreadsheet = client.open("Negative_Review_Tracker")
-        sheet = spreadsheet.get_worksheet(0) # Pehla tab uthayega
+        sheet = spreadsheet.get_worksheet(0)
 
-        # ✅ Set Professional Headers if empty
+        # Set Professional Headers if sheet is new
         if not sheet.get_all_values():
             sheet.append_row([
                 "Email", "TimeStamp", "Related Account", "Account Traffic", 
-                "Current Tool", "Account Category", "Related Contact Name"
+                "Current Tool", "Account Category", "Person Type"
             ])
         return sheet
     except Exception as e:
@@ -56,11 +55,11 @@ def get_tracker_sheet():
         return None
 
 # ==========================================
-# 3. SMARTLEAD PUSH (NEGATIVE REVIEW FLOW)
+# 3. SMARTLEAD API PUSH
 # ==========================================
 
-def push_to_smartlead_neg(email, first, last, acc_name, traffic, tool, category, contact_name):
-    """Pushes Negative Review Lead with all SS data points"""
+def push_to_smartlead_neg(email, first, last, acc_name, traffic, tool, category, p_type):
+    """Pushes Lead/Contact to Smartlead with custom fields"""
     url = f"https://server.smartlead.ai/api/v1/campaigns/{NEG_REVIEW_CAMPAIGN_ID}/leads"
     params = {"api_key": SMARTLEAD_API_KEY}
     
@@ -70,12 +69,12 @@ def push_to_smartlead_neg(email, first, last, acc_name, traffic, tool, category,
             "first_name": (first or "").strip(),
             "last_name": (last or "").strip(),
             "custom_fields": {
-                "source": "Salesforce Negative Review",
-                "related_account_id": acc_name, # Account Name mapping
+                "source": "Salesforce Automation",
+                "person_type": p_type,
+                "related_account_id": acc_name, # Account Name Fix
                 "account_traffic": traffic,
                 "current_tool": tool,
-                "account_category": category,
-                "related_contact_name": contact_name
+                "account_category": category
             }
         }],
         "settings": { "ignore_duplicate_leads_in_other_campaign": False }
@@ -84,37 +83,35 @@ def push_to_smartlead_neg(email, first, last, acc_name, traffic, tool, category,
     try:
         res = requests.post(url, params=params, json=payload)
         return res.status_code in [200, 201]
-    except Exception as e:
-        print(f"   ⚠️ Smartlead API Fail: {e}")
+    except:
         return False
 
 # ==========================================
-# 4. MAIN SYNC LOGIC
+# 4. MAIN SYNC ENGINE
 # ==========================================
 
 def run_sync():
-    print(f"🚀 Starting Negative Review Sync: {datetime.now()}")
+    print(f"🚀 Starting Negative Review & Colleague Sync: {datetime.now()}")
     
     # 1. Salesforce Login
     try:
         sf = Salesforce(username=SF_USERNAME, password=SF_PASSWORD, security_token=SF_TOKEN)
     except Exception as e:
-        print(f"❌ Salesforce Login Failed: {e}"); return
+        print(f"❌ SF Auth Error: {e}"); return
 
     # 2. Sheet Access
     sheet = get_tracker_sheet()
     if not sheet: return
 
-    # Avoid re-processing leads
+    # Load processing logs to prevent duplicates
     processed_emails = [str(e).lower() for e in sheet.col_values(1) if e]
 
-    # ✅ QUERY: Outbound + Negative Review
-    # Includes formula and lookup fields from screenshots
+    # ✅ QUERY: Based on Outbound + Negative Review + All Custom Fields
     check_time = datetime.now(timezone.utc) - timedelta(weeks=4)
     query = f"""
         SELECT Id, Email, FirstName, LastName, 
                Account_Traffic__c, Account_s_Current_Tool__c, Account_Primary_Category__c,
-               Related_Account__r.Name, Related_Contact__r.Name
+               Related_Account__r.Name, Related_Account__c
         FROM Lead 
         WHERE CreatedDate > {check_time.strftime('%Y-%m-%dT%H:%M:%SZ')}
         AND LeadSource = 'Outbound'
@@ -123,42 +120,46 @@ def run_sync():
     """
     
     leads = sf.query(query).get('records', [])
-    print(f"📄 Found {len(leads)} Negative Review leads.")
+    print(f"📄 Found {len(leads)} Main Leads in Salesforce.")
 
     for lead in leads:
         email = (lead.get('Email') or '').lower().strip()
         if not email or email in processed_emails: continue
 
-        # Fetching data points exactly from your Screenshots
+        # Mapping data from screenshots
         acc_name = lead.get('Related_Account__r', {}).get('Name') if lead.get('Related_Account__r') else lead.get('Company', 'N/A')
         traffic = lead.get('Account_Traffic__c', 'N/A')
         tool = lead.get('Account_s_Current_Tool__c', 'N/A')
         category = lead.get('Account_Primary_Category__c', 'N/A')
-        contact_name = lead.get('Related_Contact__r', {}).get('Name') if lead.get('Related_Contact__r') else 'N/A'
 
-        print(f"⚡ Processing: {email} | Account: {acc_name}")
+        print(f"⚡ Processing Main Lead: {email}")
         
-        # 3. Debounce Validation
+        # Debounce Validation
         v_res = requests.get("https://api.debounce.io/v1/", params={'api': DEBOUNCE_API_KEY, 'email': email}).json()
         
         if v_res.get('debounce', {}).get('result') in ['Accept All', 'Deliverable', 'Safe to Send']:
-            # 4. Smartlead Push
-            if push_to_smartlead_neg(email, lead.get('FirstName'), lead.get('LastName'), 
-                                     acc_name, traffic, tool, category, contact_name):
-                
-                # 5. Log to New Spreadsheet
-                sheet.append_row([
-                    email, 
-                    datetime.now().isoformat(), 
-                    acc_name, 
-                    traffic, 
-                    tool, 
-                    category, 
-                    contact_name
-                ])
+            if push_to_smartlead_neg(email, lead.get('FirstName'), lead.get('LastName'), acc_name, traffic, tool, category, "Main Lead"):
+                sheet.append_row([email, datetime.now().isoformat(), acc_name, traffic, tool, category, "Main Lead"])
                 processed_emails.append(email)
 
-    print(f"✅ Negative Review Sync Finished.")
+                # 🔍 5. COLLEAGUE SYNC: Fetching baaki contacts usi company ke
+                print(f"   🔍 Searching for colleagues at {acc_name}...")
+                safe_comp = acc_name.replace("'", "\\'")
+                contacts = sf.query(f"SELECT Email, FirstName, LastName, Status__c FROM Contact WHERE Account.Name = '{safe_comp}'").get('records', [])
+                
+                for c in contacts:
+                    c_email = (c.get('Email') or '').lower().strip()
+                    # Filters: Non-processed and active employees
+                    if c_email and c_email not in processed_emails and c.get('Status__c') != 'Left the Company':
+                        # Debounce for colleagues
+                        c_v_res = requests.get("https://api.debounce.io/v1/", params={'api': DEBOUNCE_API_KEY, 'email': c_email}).json()
+                        if c_v_res.get('debounce', {}).get('result') in ['Accept All', 'Deliverable', 'Safe to Send']:
+                            if push_to_smartlead_neg(c_email, c.get('FirstName'), c.get('LastName'), acc_name, traffic, tool, category, "Related Contact"):
+                                sheet.append_row([c_email, datetime.now().isoformat(), acc_name, traffic, tool, category, "Related Contact"])
+                                processed_emails.append(c_email)
+                                print(f"      ✅ Colleague Synced: {c_email}")
+
+    print(f"✅ Full Sync Process Finished at {datetime.now()}")
 
 if __name__ == "__main__":
     run_sync()
